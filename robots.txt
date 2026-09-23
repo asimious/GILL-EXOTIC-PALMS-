@@ -1,0 +1,6 @@
+User-agent: *
+Allow: /
+Disallow: /account
+Disallow: /#/account
+
+Sitemap: https://gillexoticpalms.com/sitemap.xml
