@@ -3,6 +3,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.2/dist/umd/supabase.min.js"></script>
+<script>
+  // Public (browser-safe) Supabase settings. Security is enforced by Row Level Security in the database.
+  window.GEP_SUPABASE = {
+    url: 'https://tbjsjveyzfvarpswtxmc.supabase.co',
+    key: 'sb_publishable_eyvSXz4XJIUxVpmOlWFMJA_PB6pijvG'
+  };
+</script>
 <script src="./support.js"></script>
 </head>
 <body>
@@ -895,6 +903,7 @@
             <span style="font-size:11.5px;letter-spacing:0.2em;text-transform:uppercase;color:#8A9789">Message</span>
             <textarea rows="4" value="{{ formMsg }}" onChange="{{ onFormMsg }}" placeholder="Tell us about your space—light, size, and what you're hoping for." style="border:1px solid rgba(30,58,43,0.18);border-radius:16px;background:transparent;padding:14px;font-size:16px;line-height:1.6;color:#1E3A2B;outline:none;resize:vertical"></textarea>
           </label>
+          <input type="text" value="{{ formHp }}" onChange="{{ onFormHp }}" tabindex="-1" autocomplete="off" aria-hidden="true" name="company_website" style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0" />
           <button type="button" onClick="{{ onSubmitContact }}" style="border:none;background:#1E3A2B;color:#FAF6EE;padding:18px;border-radius:999px;font-size:13px;letter-spacing:0.16em;text-transform:uppercase;cursor:pointer;margin-top:6px;transition:all .28s" style-hover="background:#14291F">Send message</button>
           <div style="font-size:14px;color:#B98C4A;min-height:20px">{{ contactNote }}</div>
         </div>
@@ -1108,7 +1117,7 @@ class Component extends DCLogic {
     newsNote: '',
     checkoutNote: '',
     order: null,
-    payMethod: 'bank',
+    payMethod: 'wallet',
     copied: '',
     form: { name: '', email: '', topic: 'order', msg: '' },
     contactNote: '',
@@ -1126,8 +1135,95 @@ class Component extends DCLogic {
     mob: typeof window !== 'undefined' ? window.innerWidth < 768 : false,
     tight: typeof window !== 'undefined' ? window.innerWidth < 1060 : false,
     menuOpen: false,
-    menuShopOpen: false
+    menuShopOpen: false,
+    dbCatalog: null,
+    dbPosts: null,
+    dbSettings: null,
+    busy: false,
+    formHp: ''
   };
+
+  // ---------- Supabase ----------
+  sb() {
+    if (this._sb !== undefined) return this._sb;
+    try {
+      const c = window.GEP_SUPABASE;
+      this._sb = (window.supabase && c) ? window.supabase.createClient(c.url, c.key) : null;
+    } catch (e) { this._sb = null; }
+    return this._sb;
+  }
+
+  async loadFromDb() {
+    const sb = this.sb();
+    if (!sb) return;
+    try {
+      const [cats, prods, posts, settings] = await Promise.all([
+        sb.from('categories').select('slug,name,tagline,intro,banner_image_id,card_image_id,sort_order').order('sort_order'),
+        sb.from('products').select('id,slug,legacy_id,category_slug,name,description,base_price_pkr,rating,image_id,light,height,care,sort_order').order('sort_order'),
+        sb.from('blog_posts').select('slug,title,tag,excerpt,body,image_id,read_time,published_on').order('sort_order').order('published_on', { ascending: false }),
+        sb.from('store_settings').select('*').eq('id', 1).maybeSingle()
+      ]);
+      const upd = {};
+      if (!cats.error && !prods.error && cats.data.length && prods.data.length) {
+        this._uuid = {};
+        const builtin = this.builtinCatalog();
+        upd.dbCatalog = cats.data.map(c => {
+          const b = builtin.find(x => x.slug === c.slug) || {};
+          return {
+            slug: c.slug, name: c.name, tagline: c.tagline || b.tagline || '', intro: c.intro || b.intro || '',
+            banner: c.banner_image_id || b.banner, card: c.card_image_id || b.card,
+            items: prods.data.filter(p => p.category_slug === c.slug).map(p => {
+              const key = p.legacy_id || p.slug;
+              this._uuid[key] = p.id;
+              return [p.name, p.description || '', Number(p.base_price_pkr), Number(p.rating || 0), p.image_id, p.light || '', p.height || '', p.care || '', key];
+            })
+          };
+        }).filter(c => c.items.length);
+      }
+      if (!posts.error && posts.data.length) {
+        const months = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+        upd.dbPosts = posts.data.map(p => {
+          const d = p.published_on ? new Date(p.published_on + 'T00:00:00') : null;
+          return { tag: p.tag || '', date: d ? months[d.getMonth()] + ' ' + d.getFullYear() : '', title: p.title, img: p.image_id,
+                   excerpt: p.excerpt || '', body: Array.isArray(p.body) ? p.body : [], slug: p.slug, readDb: p.read_time };
+        });
+      }
+      if (!settings.error && settings.data) upd.dbSettings = settings.data;
+      if (Object.keys(upd).length) this.setState(upd);
+    } catch (e) { /* keep the built-in catalogue if the database is unreachable */ }
+  }
+
+  async loadProfile(session) {
+    const sb = this.sb();
+    if (!sb || !session || !session.user) { this.setUser(null); return; }
+    const u = session.user;
+    let p = null;
+    try {
+      const r = await sb.from('profiles').select('full_name,phone,tier,business_name,wholesale_approved').eq('id', u.id).maybeSingle();
+      p = r.data;
+    } catch (e) {}
+    const meta = u.user_metadata || {};
+    const tier = (p && p.tier) || meta.tier || 'retail';
+    this.setUser({
+      name: (p && p.full_name) || meta.full_name || u.email,
+      email: u.email,
+      tier: tier,
+      business: (p && p.business_name) || meta.business_name || '',
+      phone: (p && p.phone) || meta.phone || '',
+      approved: tier !== 'wholesale' || !!(p && p.wholesale_approved)
+    });
+  }
+
+  authError(msg) {
+    const m = String(msg || '').toLowerCase();
+    if (m.indexOf('already registered') > -1 || m.indexOf('already been registered') > -1) return 'That email already has an account — try signing in.';
+    if (m.indexOf('email address') > -1 && m.indexOf('invalid') > -1) return 'Please use a real, working email address.';
+    if (m.indexOf('invalid login') > -1) return 'Email or password is incorrect.';
+    if (m.indexOf('not confirmed') > -1) return 'Please confirm your email first — check your inbox for our link.';
+    if (m.indexOf('rate limit') > -1 || m.indexOf('too many') > -1) return 'Too many attempts — please wait a few minutes and try again.';
+    if (m.indexOf('password') > -1) return 'Please choose a stronger password (at least 6 characters).';
+    return 'Something went wrong — please try again in a moment.';
+  }
 
   celebrate(name) {
     this.setState({ welcome: name });
@@ -1136,6 +1232,17 @@ class Component extends DCLogic {
   }
 
   postData() {
+    const db = this.state.dbPosts;
+    if (db) {
+      return db.map(p => {
+        const words = p.body.reduce((n, b) => n + String(b[1]).split(/\s+/).length, 0);
+        return Object.assign({}, p, { read: Math.max(2, Math.round(words / 225)) + ' min read' });
+      });
+    }
+    return this.builtinPosts();
+  }
+
+  builtinPosts() {
     return [
       {
         tag: 'Care notes', date: 'September 2026', title: 'Watering palms as the light shortens', read: '9 min read', img: '1615309363679-fed456ff8113',
@@ -1641,8 +1748,17 @@ class Component extends DCLogic {
   }
 
   priceFor(base) {
-    const sale = base * (1 - (this.props.salePercent || 7) / 100);
-    return this.isWholesale() ? sale * 0.75 : sale;
+    const st = this.state.dbSettings;
+    const salePct = st ? Number(st.sale_percent) : (this.props.salePercent || 7);
+    const tradePct = st ? Number(st.wholesale_discount_percent) : 25;
+    let v = base * (1 - salePct / 100);
+    if (this.isWholesale()) v = v * (1 - tradePct / 100);
+    return Math.round(v / 10) * 10;
+  }
+
+  shipRule() {
+    const st = this.state.dbSettings;
+    return { free: st ? Number(st.free_delivery_threshold_pkr) : 15000, fee: st ? Number(st.delivery_fee_pkr) : 800 };
   }
 
   money(n) {
@@ -1662,6 +1778,10 @@ class Component extends DCLogic {
   }
 
   catalog() {
+    return this.state.dbCatalog || this.builtinCatalog();
+  }
+
+  builtinCatalog() {
     return [
       {
         slug: 'indoor', name: 'Indoor Palms', banner: '1673814029980-5983558a0d9a', card: '1673814029980-5983558a0d9a',
@@ -1754,7 +1874,7 @@ class Component extends DCLogic {
     this.catalog().forEach(c => {
       c.items.slice(0, per).forEach((it, i) => {
         out.push({
-          id: c.slug + '-' + i,
+          id: it[8] || (c.slug + '-' + i),
           slug: c.slug,
           catName: c.name,
           name: it[0], desc: it[1], base: it[2], price: this.priceFor(it[2]), rating: it[3],
@@ -1771,9 +1891,22 @@ class Component extends DCLogic {
     try {
       const raw = localStorage.getItem('gep_cart');
       if (raw) this.setState({ cart: JSON.parse(raw) });
-      const u = localStorage.getItem('gep_user');
-      if (u) this.setState({ user: JSON.parse(u) });
+      // Old versions stored accounts (with passwords) in the browser — remove them.
+      localStorage.removeItem('gep_accounts');
+      localStorage.removeItem('gep_user');
+      localStorage.removeItem('gep_last_order');
     } catch (e) {}
+    this.loadFromDb();
+    const sb = this.sb();
+    if (sb) {
+      sb.auth.getSession().then(r => this.loadProfile(r.data && r.data.session)).catch(() => {});
+      const sub = sb.auth.onAuthStateChange((event, session) => {
+        if (event === 'SIGNED_IN' || event === 'SIGNED_OUT' || event === 'USER_UPDATED') {
+          setTimeout(() => this.loadProfile(session), 0);
+        }
+      });
+      this._authSub = sub && sub.data && sub.data.subscription;
+    }
     this.promoteImages();
     this._onResize = () => {
       const n = window.innerWidth < 940;
@@ -1811,6 +1944,7 @@ class Component extends DCLogic {
     if (this._onResize) window.removeEventListener('resize', this._onResize);
     if (this._onHash) window.removeEventListener('hashchange', this._onHash);
     if (this._ro) this._ro.disconnect();
+    if (this._authSub) this._authSub.unsubscribe();
   }
 
   componentDidUpdate(prevProps, prevState) {
@@ -1825,23 +1959,34 @@ class Component extends DCLogic {
     try { document.body.style.overflow = ''; } catch (e) {}
   }
 
-  placeOrder() {
+  async placeOrder() {
     const s = this.state;
-    const sub = s.cart.reduce((a, l) => a + this.priceFor(l.price) * l.qty, 0);
-    const del = sub >= 15000 ? 0 : 800;
-    const n = 'GEP-' + new Date().getFullYear() + '-' + String(Math.floor(1000 + Math.random() * 9000));
+    const sb = this.sb();
+    if (s.busy) return;
+    if (!sb) { this.setState({ checkoutNote: 'We could not reach our order system. Please try again or message us.' }); return; }
+    this.setState({ busy: true, checkoutNote: 'Placing your order…' });
+    const items = s.cart.map(l => (this._uuid && this._uuid[l.id])
+      ? { product_id: this._uuid[l.id], quantity: l.qty }
+      : { legacy_id: l.id, quantity: l.qty });
+    const { data, error } = await sb.rpc('place_order', { p_items: items, p_payment_method: 'wallet' });
+    if (error || !data) {
+      const m = error && error.message ? error.message : '';
+      const friendly = /no longer available|not enough stock|cart is empty|sign in/i.test(m) ? m : 'Your order did not go through. Please try again, or contact us.';
+      this.setState({ busy: false, checkoutNote: friendly });
+      return;
+    }
+    const u = s.user || {};
     const order = {
-      number: n,
+      number: data.order_number,
       placedAt: new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }),
-      lines: s.cart.map(l => ({ name: l.name, qty: l.qty, total: this.priceFor(l.price) * l.qty })),
-      subtotal: sub,
-      delivery: del,
-      total: sub + del,
-      email: s.user ? s.user.email : '',
-      name: s.user ? s.user.name : ''
+      lines: (data.lines || []).map(l => ({ name: l.name, qty: l.qty, total: Number(l.total) })),
+      subtotal: Number(data.subtotal),
+      delivery: Number(data.delivery),
+      total: Number(data.total),
+      email: u.email || '',
+      name: u.name || ''
     };
-    try { localStorage.setItem('gep_last_order', JSON.stringify(order)); } catch (e) {}
-    this.setState({ order: order, cart: [], cartOpen: false, checkoutNote: '', payMethod: 'bank' });
+    this.setState({ busy: false, order: order, cart: [], cartOpen: false, checkoutNote: '', payMethod: 'wallet' });
     this.persist([]);
     this.go({ page: 'order' });
   }
@@ -1872,20 +2017,8 @@ class Component extends DCLogic {
     if (h && h !== this.state.navH) this.setState({ navH: h });
   }
 
-  accounts() {
-    try { return JSON.parse(localStorage.getItem('gep_accounts') || '[]'); } catch (e) { return []; }
-  }
-
-  saveAccounts(list) {
-    try { localStorage.setItem('gep_accounts', JSON.stringify(list)); } catch (e) {}
-  }
-
   setUser(u) {
     this.setState({ user: u });
-    try {
-      if (u) localStorage.setItem('gep_user', JSON.stringify(u));
-      else localStorage.removeItem('gep_user');
-    } catch (e) {}
   }
 
   persist(cart) {
@@ -1994,7 +2127,7 @@ class Component extends DCLogic {
       href: this.hrefFor({ page: 'product', id: p.id, slug: p.slug }),
       stars: this.stars(p.rating),
       ratingText: p.rating.toFixed(1) + (showQuick ? '' : ''),
-      badge: this.isWholesale() ? 'Trade price' : ((this.props.salePercent || 7) + '% off'),
+      badge: this.isWholesale() ? 'Trade price' : ((this.state.dbSettings ? Number(this.state.dbSettings.sale_percent) : (this.props.salePercent || 7)) + '% off'),
       delay: (i % 4) * 70,
       onAdd: () => this.add(p),
       onOpen: (e) => { if (e) e.preventDefault(); this.go({ page: 'product', id: p.id, slug: p.slug }); },
@@ -2057,7 +2190,8 @@ class Component extends DCLogic {
 
     const count = s.cart.reduce((a, l) => a + l.qty, 0);
     const subtotal = s.cart.reduce((a, l) => a + this.priceFor(l.price) * l.qty, 0);
-    const delivery = subtotal === 0 ? 0 : (subtotal >= 15000 ? 0 : 800);
+    const ship = this.shipRule();
+    const delivery = subtotal === 0 ? 0 : (subtotal >= ship.free ? 0 : ship.fee);
 
     const q = s.searchQ.trim().toLowerCase();
     const results = q.length < 2 ? [] : all.filter(p =>
@@ -2109,8 +2243,8 @@ class Component extends DCLogic {
       pdCare: pd ? pd.care : '',
       pdAdd: () => { if (pd) this.add(pd); },
       backToCategory: (e) => { if (e) e.preventDefault(); this.go({ page: 'category', slug: pd ? pd.slug : 'indoor' }); },
-      freeShipText: this.money(15000),
-      flatShipText: this.money(800),
+      freeShipText: this.money(this.shipRule().free),
+      flatShipText: this.money(this.shipRule().fee),
       pdWas: pd ? this.money(pd.base) : '',
       saleLabel: (this.props.salePercent || 7) + '% off this month',
       quickWas: qk ? this.money(qk.base) : '',
@@ -2200,8 +2334,14 @@ class Component extends DCLogic {
       newsNote: s.newsNote,
       onSubscribe: () => {
         const v = s.newsEmail.trim();
-        if (v.indexOf('@') < 1) { this.setState({ newsNote: 'Please enter a valid email address.' }); return; }
-        this.setState({ newsNote: 'Thank you — the next letter goes out on the first of the month.', newsEmail: '' });
+        if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(v)) { this.setState({ newsNote: 'Please enter a valid email address.' }); return; }
+        const sb = this.sb();
+        if (!sb) { this.setState({ newsNote: 'Sorry — sign-up is unavailable right now. Please try again later.' }); return; }
+        this.setState({ newsNote: 'Signing you up…' });
+        sb.rpc('subscribe_newsletter', { p_email: v }).then(({ error }) => {
+          if (error) this.setState({ newsNote: 'Sorry — that did not work. Please try again.' });
+          else this.setState({ newsNote: 'Thank you — the next letter goes out on the first of the month.', newsEmail: '' });
+        }, () => this.setState({ newsNote: 'Sorry — that did not work. Please try again.' }));
       },
 
       formName: s.form.name,
@@ -2213,13 +2353,25 @@ class Component extends DCLogic {
       onFormTopic: (e) => this.setState({ form: Object.assign({}, s.form, { topic: e.target.value }) }),
       onFormMsg: (e) => this.setState({ form: Object.assign({}, s.form, { msg: e.target.value }) }),
       contactNote: s.contactNote,
+      formHp: s.formHp,
+      onFormHp: (e) => this.setState({ formHp: e.target.value }),
       onSubmitContact: () => {
         const f = s.form;
-        if (!f.name.trim() || f.email.indexOf('@') < 1 || !f.msg.trim()) {
+        if (!f.name.trim() || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(f.email.trim()) || !f.msg.trim()) {
           this.setState({ contactNote: 'Please add your name, a valid email, and a short message.' });
           return;
         }
-        this.setState({ contactNote: 'Message sent — we reply within one working day.', form: { name: '', email: '', topic: 'order', msg: '' } });
+        const done = () => this.setState({ busy: false, contactNote: 'Message sent — we reply within one working day.', form: { name: '', email: '', topic: 'order', msg: '' }, formHp: '' });
+        if (s.formHp) { done(); return; } // spam bot filled the hidden field
+        const sb = this.sb();
+        if (!sb) { this.setState({ contactNote: 'Sorry — messages are unavailable right now. Please email us instead.' }); return; }
+        if (s.busy) return;
+        this.setState({ busy: true, contactNote: 'Sending…' });
+        sb.from('contact_messages').insert({ name: f.name.trim().slice(0, 120), email: f.email.trim().slice(0, 200), topic: f.topic, message: f.msg.trim().slice(0, 5000) })
+          .then(({ error }) => {
+            if (error) this.setState({ busy: false, contactNote: 'Sorry — your message did not send. Please try again or email us.' });
+            else done();
+          }, () => this.setState({ busy: false, contactNote: 'Sorry — your message did not send. Please try again or email us.' }));
       },
 
       reviews: [
@@ -2352,10 +2504,8 @@ class Component extends DCLogic {
       payCard: s.payMethod === 'card',
       payWallet: s.payMethod === 'wallet',
       payOptions: [
-        { key: 'bank', label: 'Bank transfer', note: 'Direct transfer to our account' },
-        { key: 'cod', label: 'Cash on delivery', note: 'Pay the rider when it arrives' },
-        { key: 'card', label: 'Card payment', note: 'Secure link sent by email' },
-        { key: 'wallet', label: 'Easypaisa / JazzCash', note: 'Mobile wallet transfer' }
+        { key: 'wallet', label: 'JazzCash', note: 'Mobile wallet transfer' },
+        { key: 'cod', label: 'Cash on delivery', note: 'Pay the rider when it arrives' }
       ].filter(o => (o.key !== 'cod' || this.props.codEnabled !== false) && (o.key !== 'wallet' || this.props.walletEnabled !== false)).map(o => ({
         label: o.label,
         note: o.note,
@@ -2364,7 +2514,11 @@ class Component extends DCLogic {
         border: s.payMethod === o.key ? '#1E3A2B' : 'rgba(30,58,43,0.18)',
         dot: s.payMethod === o.key ? '#1E3A2B' : 'transparent',
         dotBorder: s.payMethod === o.key ? '#1E3A2B' : 'rgba(30,58,43,0.3)',
-        onPick: () => this.setState({ payMethod: o.key })
+        onPick: () => {
+          this.setState({ payMethod: o.key });
+          const sb = this.sb();
+          if (sb && s.order) sb.rpc('set_order_payment_method', { p_order_number: s.order.number, p_payment_method: o.key }).then(() => {}, () => {});
+        }
       })),
       bankRows: [
         ['Account holder', this.props.bankHolder || '[YOUR BUSINESS NAME]'],
@@ -2374,8 +2528,8 @@ class Component extends DCLogic {
         ['Payment reference', s.order ? s.order.number : 'Your order number']
       ].map(r => ({ label: r[0], value: r[1], color: /^\[/.test(String(r[1])) ? '#B98C4A' : '#1E3A2B' })),
       walletRows: [
-        ['Account title', this.props.bankHolder || '[YOUR BUSINESS NAME]'],
-        ['Wallet number', this.props.walletNumber || '[YOUR EASYPAISA / JAZZCASH NUMBER]'],
+        ['Account title', 'Azam Ali Gill'],
+        ['JazzCash number', '0307 3535663'],
         ['Payment reference', s.order ? s.order.number : 'Your order number']
       ].map(r => ({ label: r[0], value: r[1], color: /^\[/.test(String(r[1])) ? '#B98C4A' : '#1E3A2B' })),
       isAuth: route.page === 'account' && !s.authIntro,
@@ -2436,32 +2590,53 @@ class Component extends DCLogic {
       signUpTabFg: s.authMode === 'up' ? '#FAF6EE' : '#1E3A2B',
       pickSignIn: () => this.setState({ authMode: 'in', authNote: '' }),
       pickSignUp: () => this.setState({ authMode: 'up', authNote: '' }),
-      onSignOut: () => { this.setUser(null); this.setState({ authNote: '', authMode: 'in' }); this.flash('Signed out'); },
-      onAuthSubmit: () => {
+      onSignOut: () => {
+        const sb = this.sb();
+        const after = () => { this.setUser(null); this.setState({ authNote: '', authMode: 'in' }); this.flash('Signed out'); };
+        if (sb) sb.auth.signOut().then(after, after); else after();
+      },
+      onAuthSubmit: async () => {
         const a = s.auth;
         const email = a.email.trim().toLowerCase();
-        if (email.indexOf('@') < 1) { this.setState({ authNote: 'Please enter a valid email address.' }); return; }
+        if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) { this.setState({ authNote: 'Please enter a valid email address.' }); return; }
         if (a.pass.length < 6) { this.setState({ authNote: 'Passwords need at least 6 characters.' }); return; }
-        const list = this.accounts();
+        const sb = this.sb();
+        if (!sb) { this.setState({ authNote: 'Sign-in is unavailable right now. Please try again shortly.' }); return; }
+        if (this.state.busy) return;
+        const blank = { name: '', email: '', pass: '', phone: '', tier: 'retail', business: '' };
         if (s.authMode === 'up') {
           if (!a.name.trim()) { this.setState({ authNote: 'Please enter your full name.' }); return; }
-          if (list.some(x => x.email === email)) { this.setState({ authNote: 'That email already has an account — try signing in.' }); return; }
           const wholesale = a.tier === 'wholesale';
           if (wholesale && !a.business.trim()) { this.setState({ authNote: 'Please add your business name for a wholesale account.' }); return; }
-          const acc = { name: a.name.trim(), email: email, pass: a.pass, phone: a.phone.trim(), tier: a.tier, business: a.business.trim(), approved: !wholesale };
-          list.push(acc);
-          this.saveAccounts(list);
-          this.setUser({ name: acc.name, email: acc.email, tier: acc.tier, business: acc.business, phone: acc.phone, approved: acc.approved });
-          this.setState({ auth: { name: '', email: '', pass: '', phone: '', tier: 'retail', business: '' }, authNote: '' });
-          this.celebrate(acc.name.split(' ')[0]);
+          this.setState({ busy: true, authNote: 'Creating your account…' });
+          const { data, error } = await sb.auth.signUp({
+            email: email, password: a.pass,
+            options: {
+              emailRedirectTo: location.origin + location.pathname + '#/account',
+              data: { full_name: a.name.trim(), phone: a.phone.trim(), tier: wholesale ? 'wholesale' : 'retail', business_name: a.business.trim() }
+            }
+          });
+          if (error) { this.setState({ busy: false, authNote: this.authError(error.message) }); return; }
+          if (data && data.user && Array.isArray(data.user.identities) && data.user.identities.length === 0) {
+            this.setState({ busy: false, authNote: 'That email already has an account — try signing in.' }); return;
+          }
+          if (!data || !data.session) {
+            this.setState({ busy: false, auth: blank, authMode: 'in', authNote: 'Almost done — we sent a confirmation link to ' + email + '. Open it, then sign in here.' });
+            return;
+          }
+          await this.loadProfile(data.session);
+          this.setState({ busy: false, auth: blank, authNote: '' });
+          this.celebrate(a.name.trim().split(' ')[0]);
           if (wholesale) this.flash('Account created — send the approval request to unlock trade prices');
           else if (this.state.cart.length) setTimeout(() => this.setState({ cartOpen: true }), 3700);
         } else {
-          const acc = list.find(x => x.email === email);
-          if (!acc || acc.pass !== a.pass) { this.setState({ authNote: 'No account matched those details. Create one below the tab above.' }); return; }
-          this.setUser({ name: acc.name, email: acc.email, tier: acc.tier || 'retail', business: acc.business || '', phone: acc.phone || '', approved: acc.approved !== false });
-          this.setState({ auth: { name: '', email: '', pass: '', phone: '', tier: 'retail', business: '' }, authNote: '' });
-          this.flash('Welcome back, ' + acc.name.split(' ')[0]);
+          this.setState({ busy: true, authNote: 'Signing in…' });
+          const { data, error } = await sb.auth.signInWithPassword({ email: email, password: a.pass });
+          if (error) { this.setState({ busy: false, authNote: this.authError(error.message) }); return; }
+          await this.loadProfile(data.session);
+          this.setState({ busy: false, auth: blank, authNote: '' });
+          const nm = (this.state.user && this.state.user.name) || email;
+          this.flash('Welcome back, ' + String(nm).split(' ')[0]);
           if (this.state.cart.length) this.setState({ cartOpen: true });
         }
       },
